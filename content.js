@@ -9,6 +9,7 @@ const TYPING_DELAY = 1500; // wait 1.5s after typing to analyze
 const lastAnalyzedByElement = new WeakMap();
 let analysisInFlight = false;
 let rateLimitedUntil = 0; // timestamp — don't send requests before this
+let contextInvalidated = false; // set when extension is reloaded mid-session
 
 // 1. Listen for keyup in most common fields (use capturing phase to bypass Gmail's stopPropagation)
 document.addEventListener('keyup', (e) => {
@@ -59,6 +60,7 @@ function setElementText(el, newText) {
 }
 
 async function analyzeActiveInput(el) {
+  if (contextInvalidated) return; // extension reloaded — wait for page refresh
   // Element may have been removed from the DOM by the time the debounce fires
   if (!document.contains(el)) return;
 
@@ -113,6 +115,10 @@ async function analyzeActiveInput(el) {
   } catch(e) {
     clearTimeout(inflightTimeout);
     analysisInFlight = false;
+    if (e.message && e.message.includes('Extension context invalidated')) {
+      contextInvalidated = true; // stop all future attempts until page refresh
+      return;
+    }
     console.error("ToneCheck send error:", e);
   }
 }
@@ -266,16 +272,22 @@ function updateMicUI() {
 }
 
 async function analyzeSpeechContext(text) {
-  if (text.length < 15) return;
-  chrome.runtime.sendMessage({ action: 'analyzeTone', text }, (response) => {
-    if (chrome.runtime.lastError) {
-      console.error("Chrome Runtime Error:", chrome.runtime.lastError);
-      return;
+  if (text.length < 15 || contextInvalidated) return;
+  try {
+    chrome.runtime.sendMessage({ action: 'analyzeTone', text }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error("ToneCheck runtime error:", chrome.runtime.lastError.message);
+        return;
+      }
+      if (response && response.isHarsh) {
+        showSpeechNudge(response);
+      }
+    });
+  } catch(e) {
+    if (e.message && e.message.includes('Extension context invalidated')) {
+      contextInvalidated = true;
     }
-    if (response && response.isHarsh) {
-      showSpeechNudge(response);
-    }
-  });
+  }
 }
 
 let speechHideTimer;
