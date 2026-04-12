@@ -13,6 +13,23 @@ const analysisInFlightSet = new Set();
 let rateLimitedUntil = 0; // timestamp — don't send requests before this
 let contextInvalidated = false; // set when extension is reloaded mid-session
 
+// Shown when chrome.runtime becomes undefined (extension reloaded while tab stayed open).
+// DOM manipulation still works without the runtime, so this is always visible to the user.
+function showContextLostBanner() {
+  if (document.getElementById('tc-reload-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'tc-reload-banner';
+  banner.style.cssText = [
+    'position:fixed', 'top:0', 'left:0', 'right:0',
+    'background:#dc2626', 'color:#fff',
+    'text-align:center', 'padding:9px 16px',
+    'font:500 13px/1 Inter,sans-serif',
+    'z-index:99999999', 'cursor:default'
+  ].join(';');
+  banner.textContent = '⚠️ ToneCheck was reloaded — please refresh this tab to restore tone analysis.';
+  document.body.appendChild(banner);
+}
+
 // Port-based messaging — keeps the MV3 service worker alive during async Gemini calls.
 // sendMessage drops the channel if the worker sleeps mid-fetch; a port does not.
 function tcSend(message, callback) {
@@ -46,7 +63,7 @@ function tcSend(message, callback) {
     if (err?.message?.includes('Extension context invalidated') ||
         err?.message?.includes('Cannot read properties of undefined')) {
       contextInvalidated = true;
-      console.warn('ToneCheck: extension context lost — please refresh this tab to restore analysis.');
+      showContextLostBanner();
       // Stop any running audio capture so it doesn't loop indefinitely
       if (isListening) stopMicCapture();
     } else {
