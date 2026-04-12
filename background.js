@@ -42,8 +42,8 @@ async function analyzeToneWithGemini(text) {
     throw new Error('API Key missing. Please set it in the extension popup.');
   }
 
-  // gemini-2.0-flash on v1beta: no thinking, fast, reliably available for simple classification
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  // gemini-2.5-flash with thinkingBudget:0 — thinking disabled = fast responses, reliably available
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
   const prompt = `Classify if this text is harsh, aggressive, condescending, or purely negative. Return ONLY valid JSON (no markdown, no backticks):
 {"isHarsh":boolean,"reason":"one-sentence reason or null","alternative":"gentler rewrite or null"}
@@ -63,7 +63,8 @@ Text: "${text}"`;
         }],
         generationConfig: {
           temperature: 0.2,
-          maxOutputTokens: 200
+          maxOutputTokens: 200,
+          thinkingConfig: { thinkingBudget: 0 }
         },
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -112,8 +113,8 @@ async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
   const apiKey = storage.apiKey;
   if (!apiKey) throw new Error('API Key missing. Please set it in the extension popup.');
 
-  // gemini-2.0-flash: multimodal audio support, faster than 2.5-flash
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  // gemini-2.5-flash with thinkingBudget:0 — audio support, thinking disabled for low latency
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
   const featureContext = audioFeatures
     ? ` Measured audio: volume RMS ${audioFeatures.avgVol}, avg pitch ${audioFeatures.avgPitch} Hz.`
@@ -132,7 +133,7 @@ async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
           { text: prompt }
         ]
       }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 200 }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } }
     })
   });
 
