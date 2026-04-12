@@ -224,6 +224,10 @@ function initSpeechRecognition() {
   };
 
   recognition.onerror = (event) => {
+    if (event.error === 'no-speech') {
+      // Silence timeout — stay in listening mode; onend will restart recognition
+      return;
+    }
     console.error('Speech recognition error', event.error);
     isListening = false;
     updateMicUI();
