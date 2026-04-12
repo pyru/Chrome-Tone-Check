@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#grad1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <defs>
+        <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#818cf8;stop-opacity:1" />
+          <stop offset="100%" style="stop-color:#c084fc;stop-opacity:1" />
+        </linearGradient>
+      </defs>
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+      <line x1="12" y1="19" x2="12" y2="22"></line>
+    </svg>
+    <h1>Tone Check</h1>
+  </div>
+
+  <div class="section">
+    <h2>Configuration</h2>
+    <label for="apiKey">Gemini API Key</label>
+    <input type="password" id="apiKey" placeholder="AIxaSy...">
+    <button id="saveKeyBtn">Save Configuration</button>
+    <div id="statusMessage" class="status"></div>
+  </div>
+
+  <div class="section">
+    <h2>How it works</h2>
+    <p class="info-text">
+      <b>Text:</b> As you type in any text box, Tone Check quietly evaluates your message. If it sounds harsh, it will give you a gentle nudge and alternative.
+    </p>
+    <p class="info-text">
+      <b>Speech:</b> Click the floating mic icon on web pages to start listening to your voice in meetings. It nudges you if you get too aggressive!
+    </p>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

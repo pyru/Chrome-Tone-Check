@@ -1,0 +1,11 @@
+# Environment variables — never commit the real .env
+.env
+
+# Chrome extension build artifacts
+*.crx
+*.pem
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/

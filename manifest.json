@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Tone Check - Gemini Flash Lite",
+  "version": "1.0",
+  "description": "Analyzes the tone of your text or speech in emails, chats, and meetings and gives you a gentle nudge if it sounds harsh.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Tone Check Settings"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
