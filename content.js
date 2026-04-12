@@ -230,8 +230,10 @@ function showNudge(targetEl, analysis) {
 // and zero-crossing rate (speech rate proxy) on every animation frame.
 // Fires immediate local alerts without any API call.
 class AudioSentimentAnalyzer {
-  constructor(stream) {
-    this.ctx = new AudioContext();
+  // existingCtx: AudioContext created synchronously in the click handler BEFORE
+  // any await, so Chrome's autoplay policy doesn't block it (Zoom is strict).
+  constructor(stream, existingCtx = null) {
+    this.ctx = existingCtx || new AudioContext();
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 2048;
     this.analyser.smoothingTimeConstant = 0.8;
@@ -239,16 +241,16 @@ class AudioSentimentAnalyzer {
     const source = this.ctx.createMediaStreamSource(stream);
     source.connect(this.analyser);
 
-    // Resume AudioContext — browsers may auto-suspend it even after a user gesture
-    this.ctx.resume().catch(() => {});
+    // Only resume if we created the context ourselves (caller already resumed theirs)
+    if (!existingCtx) this.ctx.resume().catch(() => {});
 
     this.fftBuf  = new Uint8Array(this.analyser.frequencyBinCount);
     this.timeBuf = new Uint8Array(this.analyser.fftSize);
 
-    this.volumeHistory = []; // ~3 s sliding window at rAF rate
+    this.volumeHistory = []; // sliding window (60 frames × 50 ms = 3 s)
     this.pitchHistory  = [];
     this.baselineVol   = null;
-    this.rafId         = null;
+    this.intervalId    = null; // setInterval handle (replaces rAF — works in bg tabs)
     this.lastAlertTime = 0;
   }
 
@@ -339,7 +341,10 @@ class AudioSentimentAnalyzer {
   }
 
   start(onDetect) {
-    const loop = () => {
+    // setInterval instead of requestAnimationFrame: rAF is throttled/stopped when
+    // the tab is in the background or Zoom's video layer steals GPU priority.
+    // 50 ms = 20 fps — plenty for audio-envelope analysis.
+    this.intervalId = setInterval(() => {
       const result = this.classify();
       if (result) {
         const now = Date.now();
@@ -348,13 +353,11 @@ class AudioSentimentAnalyzer {
           onDetect(result);
         }
       }
-      this.rafId = requestAnimationFrame(loop);
-    };
-    this.rafId = requestAnimationFrame(loop);
+    }, 50);
   }
 
   stop() {
-    if (this.rafId) cancelAnimationFrame(this.rafId);
+    if (this.intervalId) clearInterval(this.intervalId);
     this.ctx.close().catch(() => {});
   }
 
@@ -417,11 +420,16 @@ async function toggleListening() {
 }
 
 async function startMicCapture() {
+  // Create AudioContext NOW, synchronously within the click-handler stack, BEFORE
+  // any await. Chrome's autoplay policy suspends AudioContext created after an await.
+  const audioCtx = new AudioContext();
+  audioCtx.resume().catch(() => {}); // fire-and-forget while still in gesture context
+
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
     // ── Layer 1: start real-time local analysis ───────────────
-    audioAnalyzer = new AudioSentimentAnalyzer(stream);
+    audioAnalyzer = new AudioSentimentAnalyzer(stream, audioCtx); // reuse pre-started ctx
     audioAnalyzer.start((detection) => showLocalToneAlert(detection));
 
     // ── Layer 2: MediaRecorder → Gemini audio every 3 s (Reduced for zero-lag) ──────
@@ -451,10 +459,11 @@ async function startMicCapture() {
       }
     };
 
-    mediaRecorder.start(3000); // 3-second chunks for hyper-fast response
+    mediaRecorder.start(2000); // 2-second chunks — 33% faster Gemini turnaround
     isListening = true;
     updateMicUI();
   } catch (err) {
+    audioCtx.close().catch(() => {}); // clean up pre-created ctx if mic access failed
     isListening = false;
     updateMicUI();
     if (err.name === 'NotAllowedError') {
