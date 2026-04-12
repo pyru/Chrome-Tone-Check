@@ -86,21 +86,29 @@ async function analyzeActiveInput(el) {
   // Safety valve: if the service worker dies and never responds, unlock after 15s
   const inflightTimeout = setTimeout(() => { analysisInFlight = false; }, 15000);
 
+  // Guard: chrome.runtime can become undefined when the service worker
+  // is fully dead — different from "Extension context invalidated".
+  if (!chrome?.runtime?.sendMessage) {
+    clearTimeout(inflightTimeout);
+    analysisInFlight = false;
+    contextInvalidated = true;
+    return;
+  }
+
   try {
     chrome.runtime.sendMessage({ action: 'analyzeTone', text }, (response) => {
       clearTimeout(inflightTimeout);
       analysisInFlight = false;
 
-      if (chrome.runtime.lastError) {
-        console.error("ToneCheck runtime error:", chrome.runtime.lastError.message);
-        return;
+      if (!chrome?.runtime || chrome.runtime.lastError) {
+        return; // context gone or channel closed — silently skip
       }
 
       if (response && response.error) {
         console.error("ToneCheck API error:", response.error);
         if (response.error.includes('Rate limit')) {
-          rateLimitedUntil = Date.now() + 60_000; // back off 60s after a 429
-          lastAnalyzedByElement.delete(el); // allow retry once cooldown expires
+          rateLimitedUntil = Date.now() + 60_000;
+          lastAnalyzedByElement.delete(el);
         }
         return;
       }
@@ -115,8 +123,10 @@ async function analyzeActiveInput(el) {
   } catch(e) {
     clearTimeout(inflightTimeout);
     analysisInFlight = false;
-    if (e.message && e.message.includes('Extension context invalidated')) {
-      contextInvalidated = true; // stop all future attempts until page refresh
+    // Covers both "Extension context invalidated" and
+    // "Cannot read properties of undefined (reading 'sendMessage')"
+    if (e instanceof TypeError || (e.message && e.message.includes('context'))) {
+      contextInvalidated = true;
       return;
     }
     console.error("ToneCheck send error:", e);
@@ -377,21 +387,22 @@ async function startMicCapture() {
 
     mediaRecorder.ondataavailable = async (e) => {
       if (e.data.size < 1000 || audioAnalysisInFlight || contextInvalidated) return;
+      if (!chrome?.runtime?.sendMessage) { contextInvalidated = true; return; }
       audioAnalysisInFlight = true;
       try {
-        const base64       = await blobToBase64(e.data);
+        const base64        = await blobToBase64(e.data);
         const audioFeatures = audioAnalyzer ? audioAnalyzer.getSummary() : null;
         chrome.runtime.sendMessage(
           { action: 'analyzeMeetingAudio', audioData: base64, mimeType: e.data.type || mimeType, audioFeatures },
           (response) => {
             audioAnalysisInFlight = false;
-            if (chrome.runtime.lastError || !response || response.error) return;
+            if (!chrome?.runtime || chrome.runtime.lastError || !response || response.error) return;
             if (response.isHarsh) showSpeechNudge(response);
           }
         );
       } catch (err) {
         audioAnalysisInFlight = false;
-        if (err.message && err.message.includes('Extension context invalidated')) {
+        if (err instanceof TypeError || (err.message && err.message.includes('context'))) {
           contextInvalidated = true;
         }
       }
