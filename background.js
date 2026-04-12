@@ -11,10 +11,8 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.action === 'analyzeTone') {
-    // Use async IIFE — the .then() pattern can drop the channel if the
-    // microtask queue is flushed before the promise resolves in MV3.
     (async () => {
       try {
         const result = await analyzeToneWithGemini(request.text);
@@ -23,7 +21,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ error: error.message });
       }
     })();
-    return true; // Keep message channel open for async response
+    return true;
+  }
+
+  if (request.action === 'analyzeMeetingAudio') {
+    // Receives a base64 audio chunk from the mic widget and sends it to
+    // Gemini for dual analysis — both the words spoken AND vocal tone/anger.
+    (async () => {
+      try {
+        const result = await analyzeSpeechWithGemini(request.audioData, request.mimeType);
+        sendResponse(result);
+      } catch (error) {
+        sendResponse({ error: error.message });
+      }
+    })();
+    return true;
   }
 });
 
@@ -112,4 +124,60 @@ Text to analyze:
     console.error('Error analyzing tone:', error);
     throw error;
   }
+}
+
+// Analyzes a raw audio chunk for both spoken content AND vocal tone/anger.
+// Receives base64-encoded WebM audio recorded from the user's microphone.
+async function analyzeSpeechWithGemini(audioData, mimeType) {
+  const storage = await chrome.storage.local.get(['apiKey']);
+  const apiKey = storage.apiKey;
+  if (!apiKey) throw new Error('API Key missing. Please set it in the extension popup.');
+
+  const apiUrl = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+  const prompt = `Listen to this audio of someone speaking.
+Analyze BOTH the words used AND the emotional tone of the voice — including pitch, intensity, and pace.
+Determine if the speaker sounds angry, harsh, aggressive, or condescending, even if the words alone seem neutral.
+If yes, provide a gentler rephrasing and a brief reason.
+If no, mark as not harsh.
+Return ONLY valid JSON with no markdown:
+{
+  "isHarsh": boolean,
+  "reason": "string or null",
+  "alternative": "string or null"
+}`;
+
+  const response = await fetch(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { inline_data: { mime_type: mimeType, data: audioData } },
+          { text: prompt }
+        ]
+      }],
+      generationConfig: { temperature: 0.2 }
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let detail = errText;
+    try { detail = JSON.parse(errText).error?.message || errText; } catch {}
+    if (response.status === 429) throw new Error('Rate limit reached — please wait a moment before typing more.');
+    throw new Error(`API ${response.status}: ${detail}`);
+  }
+
+  const data = await response.json();
+  if (!data.candidates || data.candidates.length === 0) {
+    return { isHarsh: false, reason: null, alternative: null };
+  }
+
+  const candidateText = data.candidates[0]?.content?.parts?.[0]?.text;
+  if (candidateText) {
+    const cleanedText = candidateText.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleanedText);
+  }
+  throw new Error('Invalid response structure from Gemini audio API');
 }

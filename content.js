@@ -171,21 +171,18 @@ function showNudge(targetEl, analysis) {
 }
 
 // -------------------------------------------------------------
-// 2. Speech Analysis for Web Meeting Apps
+// 2. Speech Analysis — MediaRecorder → Gemini audio
+//    Detects BOTH harsh words AND angry vocal tone (pitch/intensity).
+//    Works alongside Zoom/Meet since Chrome shares the mic in shared mode.
 // -------------------------------------------------------------
-let recognition = null;
+let mediaRecorder = null;
 let isListening = false;
-let speechBuffer = "";
-let speechTimer = null;
+let audioAnalysisInFlight = false;
 
 function setupMeetingSpeechWidget() {
-  // Only inject mic widget if we are on likely meeting sites, or allow user to toggle it globally
-  // For now, let's inject it everywhere but keep it hidden unless explicitly opened?
-  // Actually, a nice floating widget is great. Let's just create it.
-  
   const micWidget = document.createElement('div');
   micWidget.id = 'tc-mic-widget';
-  // SVG Mic Icon
+  micWidget.title = 'ToneCheck: Click to monitor your speech tone';
   micWidget.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>`;
   document.body.appendChild(micWidget);
 
@@ -196,103 +193,97 @@ function setupMeetingSpeechWidget() {
   micWidget.addEventListener('click', toggleListening);
 }
 
-function initSpeechRecognition() {
-  if (!('webkitSpeechRecognition' in window)) {
-    alert("Your browser doesn't support speech recognition.");
-    return;
+async function toggleListening() {
+  if (isListening) {
+    stopMicCapture();
+  } else {
+    await startMicCapture();
   }
-  
-  recognition = new window.webkitSpeechRecognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = 'en-US';
-
-  recognition.onresult = (event) => {
-    let finalTranscript = '';
-
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-      if (event.results[i].isFinal) {
-        finalTranscript += event.results[i][0].transcript;
-      } else {
-        // interim results are not analyzed — only final transcripts are sent
-      }
-    }
-
-    if (finalTranscript) {
-      speechBuffer += finalTranscript + " ";
-      clearTimeout(speechTimer);
-      // Wait for a pause in speech (2 seconds) to evaluate tone
-      speechTimer = setTimeout(() => {
-        analyzeSpeechContext(speechBuffer);
-        speechBuffer = ""; // reset after analyze
-      }, 2000);
-    }
-  };
-
-  recognition.onerror = (event) => {
-    if (event.error === 'no-speech') {
-      // Silence timeout — stay in listening mode; onend will restart recognition
-      return;
-    }
-    console.error('Speech recognition error', event.error);
-    isListening = false;
-    updateMicUI();
-  };
-
-  recognition.onend = () => {
-    // restart if still trying to listen
-    if (isListening) {
-      recognition.start();
-    }
-  };
 }
 
-function toggleListening() {
-  if (!recognition) initSpeechRecognition();
-  if (!recognition) return; // not supported
+async function startMicCapture() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
-  if (isListening) {
-    recognition.stop();
-    isListening = false;
-  } else {
-    recognition.start();
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+    mediaRecorder.ondataavailable = async (e) => {
+      // Skip silent/tiny chunks and avoid piling up concurrent requests
+      if (e.data.size < 1000 || audioAnalysisInFlight || contextInvalidated) return;
+      audioAnalysisInFlight = true;
+      try {
+        const base64 = await blobToBase64(e.data);
+        chrome.runtime.sendMessage(
+          { action: 'analyzeMeetingAudio', audioData: base64, mimeType: e.data.type || mimeType },
+          (response) => {
+            audioAnalysisInFlight = false;
+            if (chrome.runtime.lastError || !response || response.error) return;
+            if (response.isHarsh) showSpeechNudge(response);
+          }
+        );
+      } catch (err) {
+        audioAnalysisInFlight = false;
+        if (err.message && err.message.includes('Extension context invalidated')) {
+          contextInvalidated = true;
+        }
+      }
+    };
+
+    mediaRecorder.start(6000); // analyze in 6-second chunks
     isListening = true;
+    updateMicUI();
+  } catch (err) {
+    isListening = false;
+    updateMicUI();
+    if (err.name === 'NotAllowedError') {
+      alert('ToneCheck: Please allow microphone access to analyze speech tone.');
+    } else {
+      console.error('ToneCheck mic error:', err.message);
+    }
   }
+}
+
+function stopMicCapture() {
+  if (mediaRecorder) {
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+    if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    mediaRecorder = null;
+  }
+  isListening = false;
   updateMicUI();
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 function updateMicUI() {
   const widget = document.getElementById('tc-mic-widget');
+  if (!widget) return;
   if (isListening) {
     widget.classList.add('tc-mic-listening');
+    widget.title = 'ToneCheck: Listening — click to stop';
   } else {
     widget.classList.remove('tc-mic-listening');
-    document.getElementById('tc-speech-nudge').style.display = 'none';
-  }
-}
-
-async function analyzeSpeechContext(text) {
-  if (text.length < 15 || contextInvalidated) return;
-  try {
-    chrome.runtime.sendMessage({ action: 'analyzeTone', text }, (response) => {
-      if (chrome.runtime.lastError) {
-        console.error("ToneCheck runtime error:", chrome.runtime.lastError.message);
-        return;
-      }
-      if (response && response.isHarsh) {
-        showSpeechNudge(response);
-      }
-    });
-  } catch(e) {
-    if (e.message && e.message.includes('Extension context invalidated')) {
-      contextInvalidated = true;
-    }
+    widget.title = 'ToneCheck: Click to monitor your speech tone';
+    const nudge = document.getElementById('tc-speech-nudge');
+    if (nudge) nudge.style.display = 'none';
   }
 }
 
 let speechHideTimer;
 function showSpeechNudge(analysis) {
   const nudge = document.getElementById('tc-speech-nudge');
+  if (!nudge) return;
   nudge.innerHTML = `
     <div class="tc-header">
       <span>🎙️ Speech Tone Alert</span>
@@ -307,7 +298,6 @@ function showSpeechNudge(analysis) {
     nudge.style.display = 'none';
   };
 
-  // Auto hide after 8 seconds
   clearTimeout(speechHideTimer);
   speechHideTimer = setTimeout(() => {
     nudge.style.display = 'none';
