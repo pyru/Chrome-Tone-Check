@@ -3,13 +3,38 @@
 let typingTimer;
 let activeElement = null;
 let currentNudge = null;
-const TYPING_DELAY = 1500; // wait 1.5s after typing to analyze
+const TYPING_DELAY = 700; // 0.7s debounce — fast enough to feel real-time
 
 // Per-element tracking so multiple compose windows don't share state
 const lastAnalyzedByElement = new WeakMap();
-let analysisInFlight = false;
+// Per-element in-flight Set — replaces the old global boolean so multiple
+// compose windows (Gmail, Meet chat, etc.) never block each other.
+const analysisInFlightSet = new Set();
 let rateLimitedUntil = 0; // timestamp — don't send requests before this
 let contextInvalidated = false; // set when extension is reloaded mid-session
+
+// Port-based messaging — keeps the MV3 service worker alive during async Gemini calls.
+// sendMessage drops the channel if the worker sleeps mid-fetch; a port does not.
+function tcSend(message, callback) {
+  try {
+    const port = chrome.runtime.connect({ name: 'tonecheck' });
+    let settled = false;
+
+    const finish = (response) => {
+      if (settled) return;
+      settled = true;
+      try { port.disconnect(); } catch (_) {}
+      callback(response);
+    };
+
+    port.onMessage.addListener(finish);
+    port.onDisconnect.addListener(() => finish(null));
+    port.postMessage(message);
+  } catch (_) {
+    contextInvalidated = true;
+    callback(null);
+  }
+}
 
 // 1. Listen for keyup in most common fields (use capturing phase to bypass Gmail's stopPropagation)
 document.addEventListener('keyup', (e) => {
@@ -77,60 +102,33 @@ async function analyzeActiveInput(el) {
 
   const lastText = lastAnalyzedByElement.get(el) || '';
 
-  // Skip if: same text as last analysis, another request in flight, or rate-limited
-  if (text === lastText || analysisInFlight || Date.now() < rateLimitedUntil) return;
+  // Skip if: same text, THIS element already has a request in flight, or rate-limited
+  if (text === lastText || analysisInFlightSet.has(el) || Date.now() < rateLimitedUntil) return;
 
   lastAnalyzedByElement.set(el, text);
-  analysisInFlight = true;
+  analysisInFlightSet.add(el);
 
-  // Safety valve: if the service worker dies and never responds, unlock after 15s
-  const inflightTimeout = setTimeout(() => { analysisInFlight = false; }, 15000);
+  tcSend({ action: 'analyzeTone', text }, (response) => {
+    analysisInFlightSet.delete(el);
+    if (currentNudge) currentNudge.style.opacity = '1'; // restore from dim
+    if (!response) return; // port disconnected / worker died
 
-  // Guard: chrome.runtime can become undefined when the service worker
-  // is fully dead — different from "Extension context invalidated".
-  if (!chrome?.runtime?.sendMessage) {
-    clearTimeout(inflightTimeout);
-    analysisInFlight = false;
-    contextInvalidated = true;
-    return;
-  }
-
-  try {
-    chrome.runtime.sendMessage({ action: 'analyzeTone', text }, (response) => {
-      clearTimeout(inflightTimeout);
-      analysisInFlight = false;
-
-      if (!chrome?.runtime || chrome.runtime.lastError) {
-        return; // context gone or channel closed — silently skip
+    if (response.error) {
+      console.error("ToneCheck API error:", response.error);
+      if (response.error.includes('Rate limit')) {
+        rateLimitedUntil = Date.now() + 60_000;
+        lastAnalyzedByElement.delete(el);
       }
-
-      if (response && response.error) {
-        console.error("ToneCheck API error:", response.error);
-        if (response.error.includes('Rate limit')) {
-          rateLimitedUntil = Date.now() + 60_000;
-          lastAnalyzedByElement.delete(el);
-        }
-        return;
-      }
-
-      if (response && response.isHarsh) {
-        showNudge(el, response);
-      } else if (currentNudge) {
-        currentNudge.remove();
-        currentNudge = null;
-      }
-    });
-  } catch(e) {
-    clearTimeout(inflightTimeout);
-    analysisInFlight = false;
-    // Covers both "Extension context invalidated" and
-    // "Cannot read properties of undefined (reading 'sendMessage')"
-    if (e instanceof TypeError || (e.message && e.message.includes('context'))) {
-      contextInvalidated = true;
       return;
     }
-    console.error("ToneCheck send error:", e);
-  }
+
+    if (response.isHarsh) {
+      showNudge(el, response);
+    } else if (currentNudge) {
+      currentNudge.remove();
+      currentNudge = null;
+    }
+  });
 }
 
 function showNudge(targetEl, analysis) {
@@ -154,18 +152,22 @@ function showNudge(targetEl, analysis) {
   document.body.appendChild(nudge);
   currentNudge = nudge;
 
-  // Position it near the input element
+  // Fixed positioning against the viewport — works correctly inside Gmail's
+  // scroll containers where absolute coordinates go wrong.
   const rect = targetEl.getBoundingClientRect();
-  const topPos = window.scrollY + rect.bottom + 8;
-  const leftPos = window.scrollX + rect.left;
+  const NUDGE_W = 320, NUDGE_H = 190;
+  let top  = rect.bottom + 8;
+  let left = rect.left;
 
-  nudge.style.top = topPos + 'px';
-  nudge.style.left = leftPos + 'px';
+  // Flip above the input if not enough room below
+  if (top + NUDGE_H > window.innerHeight - 8) top = rect.top - NUDGE_H - 8;
+  // Clamp horizontal so it never bleeds off-screen
+  if (left + NUDGE_W > window.innerWidth - 8) left = window.innerWidth - NUDGE_W - 8;
+  if (left < 8) left = 8;
+  if (top  < 8) top  = 8;
 
-  // Make sure it doesn't overflow right
-  if (leftPos + 300 > window.innerWidth) {
-    nudge.style.left = (window.innerWidth - 320) + 'px';
-  }
+  nudge.style.top  = top  + 'px';
+  nudge.style.left = left + 'px';
 
   // Event listeners
   document.getElementById('tc-ignore-btn').onclick = () => {
@@ -199,6 +201,9 @@ class AudioSentimentAnalyzer {
 
     const source = this.ctx.createMediaStreamSource(stream);
     source.connect(this.analyser);
+
+    // Resume AudioContext — browsers may auto-suspend it even after a user gesture
+    this.ctx.resume().catch(() => {});
 
     this.fftBuf  = new Uint8Array(this.analyser.frequencyBinCount);
     this.timeBuf = new Uint8Array(this.analyser.fftSize);
@@ -247,18 +252,18 @@ class AudioSentimentAnalyzer {
     const zcr  = this.getZCR();
     const freq = this.getDominantFreq();
 
-    if (rms < 0.02) return null; // silence — skip
+    if (rms < 0.005) return null; // silence — skip (lowered from 0.02 for noise-cancelled mics)
 
-    // Sliding windows (≈180 frames ≈ 3 s at 60 fps)
+    // Sliding windows (≈60 frames ≈ 1 s at 60 fps) to dramatically reduce latency
     this.volumeHistory.push(rms);
-    if (this.volumeHistory.length > 180) this.volumeHistory.shift();
+    if (this.volumeHistory.length > 60) this.volumeHistory.shift();
     if (freq > 0) {
       this.pitchHistory.push(freq);
-      if (this.pitchHistory.length > 180) this.pitchHistory.shift();
+      if (this.pitchHistory.length > 60) this.pitchHistory.shift();
     }
 
-    // Calibrate baseline after first 5 seconds of listening
-    if (!this.baselineVol && this.volumeHistory.length >= 300) {
+    // Calibrate baseline faster (approx 1 second of speech)
+    if (!this.baselineVol && this.volumeHistory.length >= 60) {
       this.baselineVol = this.volumeHistory.reduce((a, b) => a + b) / this.volumeHistory.length;
     }
 
@@ -274,19 +279,22 @@ class AudioSentimentAnalyzer {
     const volRatio = this.baselineVol ? avgVol / this.baselineVol : 1;
 
     // ── Classification rules ──────────────────────────────────
-    // SCREAMING: sustained very high volume (>30 of last 60 frames above threshold)
-    const loudFrames = this.volumeHistory.slice(-60).filter(v => v > 0.38).length;
-    if (avgVol > 0.42 && loudFrames > 25) {
+    // Chrome automatically normalizes mic volume (AGC), so ratios can spike easily if the room was quiet.
+    // We require a high absolute volume (avgVol > 0.10) which means they are genuinely raising their voice.
+    
+    // SCREAMING: sustained extremely high volume
+    const loudFrames = this.volumeHistory.slice(-60).filter(v => v > 0.12).length;
+    if (avgVol > 0.14 && loudFrames > 15) {
       return { type: 'screaming', rms: avgVol, pitch: avgPitch, zcr };
     }
 
-    // ANGRY: volume elevated 2× above baseline + high pitch + fast speech rate
-    if (volRatio > 2.0 && avgPitch > 220 && zcr > 0.08) {
+    // ANGRY: high absolute volume + slightly elevated pitch (works for deeper voices) + fast speech
+    if (avgVol > 0.10 && volRatio > 1.8 && avgPitch > 120 && zcr > 0.05) {
       return { type: 'angry', rms: avgVol, pitch: avgPitch, zcr };
     }
 
-    // STRESSED/TENSE: elevated volume + erratic pitch contour (sarcasm signal)
-    if (volRatio > 1.6 && pitchStdDev > 55) {
+    // STRESSED/TENSE: moderate-high volume + very erratic pitch contour
+    if (avgVol > 0.08 && volRatio > 1.5 && pitchStdDev > 25) {
       return { type: 'stressed', rms: avgVol, pitch: avgPitch, zcr };
     }
 
@@ -379,7 +387,7 @@ async function startMicCapture() {
     audioAnalyzer = new AudioSentimentAnalyzer(stream);
     audioAnalyzer.start((detection) => showLocalToneAlert(detection));
 
-    // ── Layer 2: MediaRecorder → Gemini audio every 6 s ──────
+    // ── Layer 2: MediaRecorder → Gemini audio every 3 s (Reduced for zero-lag) ──────
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus' : 'audio/webm';
 
@@ -387,28 +395,25 @@ async function startMicCapture() {
 
     mediaRecorder.ondataavailable = async (e) => {
       if (e.data.size < 1000 || audioAnalysisInFlight || contextInvalidated) return;
-      if (!chrome?.runtime?.sendMessage) { contextInvalidated = true; return; }
       audioAnalysisInFlight = true;
       try {
         const base64        = await blobToBase64(e.data);
         const audioFeatures = audioAnalyzer ? audioAnalyzer.getSummary() : null;
-        chrome.runtime.sendMessage(
+        tcSend(
           { action: 'analyzeMeetingAudio', audioData: base64, mimeType: e.data.type || mimeType, audioFeatures },
           (response) => {
             audioAnalysisInFlight = false;
-            if (!chrome?.runtime || chrome.runtime.lastError || !response || response.error) return;
+            if (!response || response.error) return;
             if (response.isHarsh) showSpeechNudge(response);
           }
         );
-      } catch (err) {
+      } catch (_) {
         audioAnalysisInFlight = false;
-        if (err instanceof TypeError || (err.message && err.message.includes('context'))) {
-          contextInvalidated = true;
-        }
+        contextInvalidated = true;
       }
     };
 
-    mediaRecorder.start(6000);
+    mediaRecorder.start(3000); // 3-second chunks for hyper-fast response
     isListening = true;
     updateMicUI();
   } catch (err) {

@@ -11,34 +11,26 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  if (request.action === 'analyzeTone') {
-    (async () => {
-      try {
-        const result = await analyzeToneWithGemini(request.text);
-        sendResponse(result);
-      } catch (error) {
-        sendResponse({ error: error.message });
-      }
-    })();
-    return true;
-  }
+// Port-based communication keeps the service worker alive during async Gemini calls.
+// sendMessage drops the channel if the worker sleeps mid-fetch; a port does not.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'tonecheck') return;
 
-  if (request.action === 'analyzeMeetingAudio') {
-    // Receives a base64 audio chunk + locally-measured features (volume, pitch)
-    // and sends both to Gemini for nuanced analysis of anger, sarcasm, etc.
-    (async () => {
-      try {
-        const result = await analyzeSpeechWithGemini(
+  port.onMessage.addListener(async (request) => {
+    try {
+      let result;
+      if (request.action === 'analyzeTone') {
+        result = await analyzeToneWithGemini(request.text);
+      } else if (request.action === 'analyzeMeetingAudio') {
+        result = await analyzeSpeechWithGemini(
           request.audioData, request.mimeType, request.audioFeatures
         );
-        sendResponse(result);
-      } catch (error) {
-        sendResponse({ error: error.message });
       }
-    })();
-    return true;
-  }
+      try { port.postMessage(result || { isHarsh: false, reason: null, alternative: null }); } catch (_) {}
+    } catch (error) {
+      try { port.postMessage({ error: error.message }); } catch (_) {}
+    }
+  });
 });
 
 async function analyzeToneWithGemini(text) {
@@ -50,24 +42,14 @@ async function analyzeToneWithGemini(text) {
     throw new Error('API Key missing. Please set it in the extension popup.');
   }
 
-  // gemini-2.0-flash is retired; gemini-2.5-flash is the current flash model.
-  const apiUrl = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  // gemini-2.0-flash-lite: no thinking, lowest latency, ideal for simple classification
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`;
 
-  const prompt = `
-You are a tone analyzer assistant. Analyze the following text (which could be an email, chat message, or transcribed speech). 
-Determine if the tone could be perceived as harsh, purely negative, aggressive, or condescending.
-If it is, provide a gentler, more constructive alternative, and a brief reason.
-If it's fine, mark it as not harsh.
-Return ONLY valid JSON in this exact format, with no markdown formatting or backticks:
-{
-  "isHarsh": boolean,
-  "reason": "string or null",
-  "alternative": "string or null"
-}
+  const prompt = `Classify if this text is harsh, aggressive, condescending, or purely negative. Return ONLY valid JSON (no markdown, no backticks):
+{"isHarsh":boolean,"reason":"one-sentence reason or null","alternative":"gentler rewrite or null"}
 
-Text to analyze:
-"${text}"
-`;
+Text: "${text}"`;
+
 
   try {
     const response = await fetch(apiUrl, {
@@ -80,7 +62,8 @@ Text to analyze:
           parts: [{ text: prompt }]
         }],
         generationConfig: {
-          temperature: 0.2
+          temperature: 0.2,
+          maxOutputTokens: 200
         },
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -93,9 +76,6 @@ Text to analyze:
 
     if (!response.ok) {
       const errText = await response.text();
-      // Extract the human-readable message from Gemini's error JSON so it
-      // surfaces in the Gmail console rather than staying buried in the
-      // service worker console.
       let detail = errText;
       try { detail = JSON.parse(errText).error?.message || errText; } catch {}
       if (response.status === 429) {
@@ -105,17 +85,15 @@ Text to analyze:
     }
 
     const data = await response.json();
-    
-    // Check if it got blocked by safety or had no candidates
+
     if (!data.candidates || data.candidates.length === 0) {
       console.error("No candidates returned, possibly blocked by safety constraints.", data);
-       return { isHarsh: false, reason: "Text was blocked or could not be analyzed.", alternative: "" };
+      return { isHarsh: false, reason: "Text was blocked or could not be analyzed.", alternative: "" };
     }
 
     const candidateText = data.candidates[0]?.content?.parts?.[0]?.text;
-    
+
     if (candidateText) {
-      // Strip any markdown fences the model may wrap around the JSON
       const cleanedText = candidateText.replace(/```json/g, '').replace(/```/g, '').trim();
       return JSON.parse(cleanedText);
     } else {
@@ -129,36 +107,20 @@ Text to analyze:
 }
 
 // Analyzes a raw audio chunk for both spoken content AND vocal tone/anger.
-// Receives base64-encoded WebM audio recorded from the user's microphone.
 async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
   const storage = await chrome.storage.local.get(['apiKey']);
   const apiKey = storage.apiKey;
   if (!apiKey) throw new Error('API Key missing. Please set it in the extension popup.');
 
-  const apiUrl = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  // gemini-2.0-flash: multimodal audio support, faster than 2.5-flash
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
 
-  // Append locally-measured signal features so Gemini has quantitative context
-  // to help detect sarcasm, anger, and screaming more accurately.
   const featureContext = audioFeatures
-    ? `\nLocally measured audio features — volume RMS: ${audioFeatures.avgVol} (0–1 scale), average pitch: ${audioFeatures.avgPitch} Hz.`
+    ? ` Measured audio: volume RMS ${audioFeatures.avgVol}, avg pitch ${audioFeatures.avgPitch} Hz.`
     : '';
 
-  const prompt = `Listen to this audio of someone speaking.${featureContext}
-Analyze ALL of the following dimensions:
-1. WORDS: Are the words harsh, dismissive, threatening, or condescending?
-2. ANGER: Does the voice sound tense, loud, or aggressive in tone?
-3. SCREAMING: Is the speaker shouting or raising their voice excessively?
-4. SARCASM: Does the intonation suggest sarcasm (exaggerated pitch rise/fall, drawn-out words, mocking tone)?
-
-Detect any of the above — even if the words alone seem neutral (e.g. "That's FINE" said sarcastically).
-If any dimension is problematic, provide a calmer rephrasing and a brief reason.
-If everything is fine, mark as not harsh.
-Return ONLY valid JSON with no markdown:
-{
-  "isHarsh": boolean,
-  "reason": "string or null",
-  "alternative": "string or null"
-}`;
+  const prompt = `Listen to this audio clip.${featureContext} Detect if the speaker is harsh, angry, screaming, or sarcastic — judge BOTH words and vocal tone (a calm "That's fine" vs a mocking "That's FINE"). Return ONLY valid JSON (no markdown):
+{"isHarsh":boolean,"reason":"one-sentence reason or null","alternative":"calmer rewrite or null"}`;
 
   const response = await fetch(apiUrl, {
     method: 'POST',
@@ -170,7 +132,7 @@ Return ONLY valid JSON with no markdown:
           { text: prompt }
         ]
       }],
-      generationConfig: { temperature: 0.2 }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 200 }
     })
   });
 

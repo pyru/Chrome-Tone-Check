@@ -2,7 +2,7 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
 #tone-check-nudge {
-  position: absolute;
+  position: fixed;
   z-index: 999999;
   background: rgba(20, 20, 20, 0.95);
   backdrop-filter: blur(10px);
