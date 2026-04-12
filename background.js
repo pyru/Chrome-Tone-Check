@@ -42,8 +42,8 @@ async function analyzeToneWithGemini(text) {
     throw new Error('API Key missing. Please set it in the extension popup.');
   }
 
-  // gemini-2.0-flash-lite: no thinking, lowest latency, ideal for simple classification
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`;
+  // gemini-2.0-flash on v1beta: no thinking, fast, reliably available for simple classification
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
 
   const prompt = `Classify if this text is harsh, aggressive, condescending, or purely negative. Return ONLY valid JSON (no markdown, no backticks):
 {"isHarsh":boolean,"reason":"one-sentence reason or null","alternative":"gentler rewrite or null"}

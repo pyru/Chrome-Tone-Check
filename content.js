@@ -18,6 +18,8 @@ let contextInvalidated = false; // set when extension is reloaded mid-session
 function tcSend(message, callback) {
   try {
     const port = chrome.runtime.connect({ name: 'tonecheck' });
+    // Successful connect → extension is alive; clear any stale invalidation flag
+    contextInvalidated = false;
     let settled = false;
 
     const finish = (response) => {
@@ -28,10 +30,24 @@ function tcSend(message, callback) {
     };
 
     port.onMessage.addListener(finish);
-    port.onDisconnect.addListener(() => finish(null));
+    // Port disconnect without a reply (service worker died mid-fetch) —
+    // call back with null so the caller cleans up, but do NOT permanently
+    // disable analysis; the SW will restart on the next keystroke.
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError; // consume the error to silence Chrome warnings
+      finish(null);
+    });
     port.postMessage(message);
-  } catch (_) {
-    contextInvalidated = true;
+  } catch (err) {
+    // Only flag as permanently gone when Chrome says the context is truly invalid.
+    // Any other error (SW still waking up, brief unavailability) is transient —
+    // log it and let the next keystroke retry instead of killing analysis forever.
+    if (err?.message?.includes('Extension context invalidated') ||
+        err?.message?.includes('Cannot read properties of undefined reading')) {
+      contextInvalidated = true;
+    } else {
+      console.warn('ToneCheck: transient connect error, will retry on next keystroke —', err?.message);
+    }
     callback(null);
   }
 }
