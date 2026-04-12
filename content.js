@@ -42,9 +42,13 @@ function tcSend(message, callback) {
     // Only flag as permanently gone when Chrome says the context is truly invalid.
     // Any other error (SW still waking up, brief unavailability) is transient —
     // log it and let the next keystroke retry instead of killing analysis forever.
+    // "Cannot read properties of undefined (reading 'connect')" → chrome.runtime is gone
     if (err?.message?.includes('Extension context invalidated') ||
-        err?.message?.includes('Cannot read properties of undefined reading')) {
+        err?.message?.includes('Cannot read properties of undefined')) {
       contextInvalidated = true;
+      console.warn('ToneCheck: extension context lost — please refresh this tab to restore analysis.');
+      // Stop any running audio capture so it doesn't loop indefinitely
+      if (isListening) stopMicCapture();
     } else {
       console.warn('ToneCheck: transient connect error, will retry on next keystroke —', err?.message);
     }
@@ -426,6 +430,7 @@ async function startMicCapture() {
       } catch (_) {
         audioAnalysisInFlight = false;
         contextInvalidated = true;
+        stopMicCapture(); // stop recording — no point continuing without the runtime
       }
     };
 
