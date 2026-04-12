@@ -25,11 +25,13 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   }
 
   if (request.action === 'analyzeMeetingAudio') {
-    // Receives a base64 audio chunk from the mic widget and sends it to
-    // Gemini for dual analysis — both the words spoken AND vocal tone/anger.
+    // Receives a base64 audio chunk + locally-measured features (volume, pitch)
+    // and sends both to Gemini for nuanced analysis of anger, sarcasm, etc.
     (async () => {
       try {
-        const result = await analyzeSpeechWithGemini(request.audioData, request.mimeType);
+        const result = await analyzeSpeechWithGemini(
+          request.audioData, request.mimeType, request.audioFeatures
+        );
         sendResponse(result);
       } catch (error) {
         sendResponse({ error: error.message });
@@ -128,18 +130,29 @@ Text to analyze:
 
 // Analyzes a raw audio chunk for both spoken content AND vocal tone/anger.
 // Receives base64-encoded WebM audio recorded from the user's microphone.
-async function analyzeSpeechWithGemini(audioData, mimeType) {
+async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
   const storage = await chrome.storage.local.get(['apiKey']);
   const apiKey = storage.apiKey;
   if (!apiKey) throw new Error('API Key missing. Please set it in the extension popup.');
 
   const apiUrl = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
-  const prompt = `Listen to this audio of someone speaking.
-Analyze BOTH the words used AND the emotional tone of the voice — including pitch, intensity, and pace.
-Determine if the speaker sounds angry, harsh, aggressive, or condescending, even if the words alone seem neutral.
-If yes, provide a gentler rephrasing and a brief reason.
-If no, mark as not harsh.
+  // Append locally-measured signal features so Gemini has quantitative context
+  // to help detect sarcasm, anger, and screaming more accurately.
+  const featureContext = audioFeatures
+    ? `\nLocally measured audio features — volume RMS: ${audioFeatures.avgVol} (0–1 scale), average pitch: ${audioFeatures.avgPitch} Hz.`
+    : '';
+
+  const prompt = `Listen to this audio of someone speaking.${featureContext}
+Analyze ALL of the following dimensions:
+1. WORDS: Are the words harsh, dismissive, threatening, or condescending?
+2. ANGER: Does the voice sound tense, loud, or aggressive in tone?
+3. SCREAMING: Is the speaker shouting or raising their voice excessively?
+4. SARCASM: Does the intonation suggest sarcasm (exaggerated pitch rise/fall, drawn-out words, mocking tone)?
+
+Detect any of the above — even if the words alone seem neutral (e.g. "That's FINE" said sarcastically).
+If any dimension is problematic, provide a calmer rephrasing and a brief reason.
+If everything is fine, mark as not harsh.
 Return ONLY valid JSON with no markdown:
 {
   "isHarsh": boolean,

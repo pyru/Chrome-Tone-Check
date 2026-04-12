@@ -170,18 +170,182 @@ function showNudge(targetEl, analysis) {
   };
 }
 
-// -------------------------------------------------------------
-// 2. Speech Analysis — MediaRecorder → Gemini audio
-//    Detects BOTH harsh words AND angry vocal tone (pitch/intensity).
-//    Works alongside Zoom/Meet since Chrome shares the mic in shared mode.
-// -------------------------------------------------------------
-let mediaRecorder = null;
-let isListening = false;
+// =============================================================
+// 2. Real-time Audio Sentiment Analysis
+//    Layer 1 — instant local detection (pitch, volume, speech rate)
+//    Layer 2 — Gemini audio analysis every 6 s (anger, sarcasm, nuance)
+// =============================================================
+
+// ── Layer 1: AudioSentimentAnalyzer ──────────────────────────
+// Uses Web Audio API to measure RMS volume, dominant pitch (FFT),
+// and zero-crossing rate (speech rate proxy) on every animation frame.
+// Fires immediate local alerts without any API call.
+class AudioSentimentAnalyzer {
+  constructor(stream) {
+    this.ctx = new AudioContext();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.analyser.smoothingTimeConstant = 0.8;
+
+    const source = this.ctx.createMediaStreamSource(stream);
+    source.connect(this.analyser);
+
+    this.fftBuf  = new Uint8Array(this.analyser.frequencyBinCount);
+    this.timeBuf = new Uint8Array(this.analyser.fftSize);
+
+    this.volumeHistory = []; // ~3 s sliding window at rAF rate
+    this.pitchHistory  = [];
+    this.baselineVol   = null;
+    this.rafId         = null;
+    this.lastAlertTime = 0;
+  }
+
+  // Root-mean-square energy → loudness
+  getRMS() {
+    this.analyser.getByteTimeDomainData(this.timeBuf);
+    let sum = 0;
+    for (const v of this.timeBuf) { const n = (v - 128) / 128; sum += n * n; }
+    return Math.sqrt(sum / this.timeBuf.length);
+  }
+
+  // Zero-crossing rate → speech rate / sharpness
+  getZCR() {
+    this.analyser.getByteTimeDomainData(this.timeBuf);
+    let c = 0;
+    for (let i = 1; i < this.timeBuf.length; i++) {
+      const a = this.timeBuf[i - 1] - 128, b = this.timeBuf[i] - 128;
+      if ((a >= 0) !== (b >= 0)) c++;
+    }
+    return c / this.timeBuf.length;
+  }
+
+  // Dominant frequency in the voice range (80–600 Hz) via FFT
+  getDominantFreq() {
+    this.analyser.getByteFrequencyData(this.fftBuf);
+    const sr = this.ctx.sampleRate, fftSize = this.analyser.fftSize;
+    const lo = Math.floor(80  * fftSize / sr);
+    const hi = Math.floor(600 * fftSize / sr);
+    let maxVal = 0, maxIdx = lo;
+    for (let i = lo; i < hi; i++) {
+      if (this.fftBuf[i] > maxVal) { maxVal = this.fftBuf[i]; maxIdx = i; }
+    }
+    return maxVal > 20 ? (maxIdx * sr / fftSize) : 0;
+  }
+
+  classify() {
+    const rms  = this.getRMS();
+    const zcr  = this.getZCR();
+    const freq = this.getDominantFreq();
+
+    if (rms < 0.02) return null; // silence — skip
+
+    // Sliding windows (≈180 frames ≈ 3 s at 60 fps)
+    this.volumeHistory.push(rms);
+    if (this.volumeHistory.length > 180) this.volumeHistory.shift();
+    if (freq > 0) {
+      this.pitchHistory.push(freq);
+      if (this.pitchHistory.length > 180) this.pitchHistory.shift();
+    }
+
+    // Calibrate baseline after first 5 seconds of listening
+    if (!this.baselineVol && this.volumeHistory.length >= 300) {
+      this.baselineVol = this.volumeHistory.reduce((a, b) => a + b) / this.volumeHistory.length;
+    }
+
+    const avgVol   = this.volumeHistory.reduce((a, b) => a + b, 0) / this.volumeHistory.length;
+    const avgPitch = this.pitchHistory.length
+      ? this.pitchHistory.reduce((a, b) => a + b, 0) / this.pitchHistory.length : 0;
+
+    // Pitch standard deviation — high variance = erratic/emotional delivery
+    const pitchStdDev = this.pitchHistory.length > 1
+      ? Math.sqrt(this.pitchHistory.reduce((acc, p) => acc + (p - avgPitch) ** 2, 0) / this.pitchHistory.length)
+      : 0;
+
+    const volRatio = this.baselineVol ? avgVol / this.baselineVol : 1;
+
+    // ── Classification rules ──────────────────────────────────
+    // SCREAMING: sustained very high volume (>30 of last 60 frames above threshold)
+    const loudFrames = this.volumeHistory.slice(-60).filter(v => v > 0.38).length;
+    if (avgVol > 0.42 && loudFrames > 25) {
+      return { type: 'screaming', rms: avgVol, pitch: avgPitch, zcr };
+    }
+
+    // ANGRY: volume elevated 2× above baseline + high pitch + fast speech rate
+    if (volRatio > 2.0 && avgPitch > 220 && zcr > 0.08) {
+      return { type: 'angry', rms: avgVol, pitch: avgPitch, zcr };
+    }
+
+    // STRESSED/TENSE: elevated volume + erratic pitch contour (sarcasm signal)
+    if (volRatio > 1.6 && pitchStdDev > 55) {
+      return { type: 'stressed', rms: avgVol, pitch: avgPitch, zcr };
+    }
+
+    return null;
+  }
+
+  start(onDetect) {
+    const loop = () => {
+      const result = this.classify();
+      if (result) {
+        const now = Date.now();
+        if (now - this.lastAlertTime > 4000) { // throttle: one local alert per 4 s
+          this.lastAlertTime = now;
+          onDetect(result);
+        }
+      }
+      this.rafId = requestAnimationFrame(loop);
+    };
+    this.rafId = requestAnimationFrame(loop);
+  }
+
+  stop() {
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    this.ctx.close().catch(() => {});
+  }
+
+  // Summary passed to Gemini as additional context for every audio chunk
+  getSummary() {
+    const avgVol = this.volumeHistory.length
+      ? (this.volumeHistory.reduce((a, b) => a + b, 0) / this.volumeHistory.length).toFixed(3)
+      : '0';
+    const avgPitch = this.pitchHistory.length
+      ? Math.round(this.pitchHistory.reduce((a, b) => a + b, 0) / this.pitchHistory.length)
+      : 0;
+    return { avgVol, avgPitch };
+  }
+}
+
+// ── Local alert messages ──────────────────────────────────────
+const LOCAL_TONE_ALERTS = {
+  screaming: {
+    icon: '🔊',
+    label: 'Volume Alert — You are screaming',
+    reason: 'Your voice volume is very high, which can feel aggressive or threatening to others.',
+    tip: 'Lower your voice, take a slow breath, and continue at a calmer volume.'
+  },
+  angry: {
+    icon: '😤',
+    label: 'Tone Alert — Angry voice detected',
+    reason: 'High volume + elevated pitch + fast speech pace — this combination signals anger.',
+    tip: 'Pause, slow your speech, and soften your tone before continuing.'
+  },
+  stressed: {
+    icon: '⚡',
+    label: 'Tone Alert — Stressed or sarcastic delivery',
+    reason: 'Irregular pitch contour detected — this can come across as sarcastic or dismissive.',
+    tip: 'Speak at a steady, even pace and keep your tone neutral and direct.'
+  }
+};
+
+// ── Speech section state ──────────────────────────────────────
+let mediaRecorder       = null;
+let audioAnalyzer       = null;
+let isListening         = false;
 let audioAnalysisInFlight = false;
 
 function setupMeetingSpeechWidget() {
   const micWidget = document.createElement('div');
-  micWidget.id = 'tc-mic-widget';
+  micWidget.id    = 'tc-mic-widget';
   micWidget.title = 'ToneCheck: Click to monitor your speech tone';
   micWidget.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>`;
   document.body.appendChild(micWidget);
@@ -194,31 +358,31 @@ function setupMeetingSpeechWidget() {
 }
 
 async function toggleListening() {
-  if (isListening) {
-    stopMicCapture();
-  } else {
-    await startMicCapture();
-  }
+  if (isListening) { stopMicCapture(); } else { await startMicCapture(); }
 }
 
 async function startMicCapture() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
+    // ── Layer 1: start real-time local analysis ───────────────
+    audioAnalyzer = new AudioSentimentAnalyzer(stream);
+    audioAnalyzer.start((detection) => showLocalToneAlert(detection));
+
+    // ── Layer 2: MediaRecorder → Gemini audio every 6 s ──────
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
 
     mediaRecorder = new MediaRecorder(stream, { mimeType });
 
     mediaRecorder.ondataavailable = async (e) => {
-      // Skip silent/tiny chunks and avoid piling up concurrent requests
       if (e.data.size < 1000 || audioAnalysisInFlight || contextInvalidated) return;
       audioAnalysisInFlight = true;
       try {
-        const base64 = await blobToBase64(e.data);
+        const base64       = await blobToBase64(e.data);
+        const audioFeatures = audioAnalyzer ? audioAnalyzer.getSummary() : null;
         chrome.runtime.sendMessage(
-          { action: 'analyzeMeetingAudio', audioData: base64, mimeType: e.data.type || mimeType },
+          { action: 'analyzeMeetingAudio', audioData: base64, mimeType: e.data.type || mimeType, audioFeatures },
           (response) => {
             audioAnalysisInFlight = false;
             if (chrome.runtime.lastError || !response || response.error) return;
@@ -233,7 +397,7 @@ async function startMicCapture() {
       }
     };
 
-    mediaRecorder.start(6000); // analyze in 6-second chunks
+    mediaRecorder.start(6000);
     isListening = true;
     updateMicUI();
   } catch (err) {
@@ -248,6 +412,7 @@ async function startMicCapture() {
 }
 
 function stopMicCapture() {
+  if (audioAnalyzer) { audioAnalyzer.stop(); audioAnalyzer = null; }
   if (mediaRecorder) {
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
     if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
@@ -281,27 +446,34 @@ function updateMicUI() {
 }
 
 let speechHideTimer;
+
+// Immediate local alert (no API call) triggered by AudioSentimentAnalyzer
+function showLocalToneAlert(detection) {
+  const msg = LOCAL_TONE_ALERTS[detection.type];
+  if (!msg) return;
+  renderSpeechNudge(`${msg.icon} ${msg.label}`, msg.reason, msg.tip);
+}
+
+// Gemini-powered alert (sarcasm, nuanced anger, harsh words)
 function showSpeechNudge(analysis) {
+  renderSpeechNudge('🎙️ Speech Tone Alert', analysis.reason, analysis.alternative);
+}
+
+function renderSpeechNudge(title, reason, tip) {
   const nudge = document.getElementById('tc-speech-nudge');
   if (!nudge) return;
   nudge.innerHTML = `
     <div class="tc-header">
-      <span>🎙️ Speech Tone Alert</span>
+      <span>${title}</span>
       <button id="tc-speech-close" style="background:none;border:none;color:white;cursor:pointer">✕</button>
     </div>
-    <div class="tc-reason">${analysis.reason}</div>
-    <div class="tc-alternative">"Try saying: ${analysis.alternative}"</div>
+    <div class="tc-reason">${reason}</div>
+    <div class="tc-alternative">"${tip}"</div>
   `;
   nudge.style.display = 'flex';
-
-  document.getElementById('tc-speech-close').onclick = () => {
-    nudge.style.display = 'none';
-  };
-
+  document.getElementById('tc-speech-close').onclick = () => { nudge.style.display = 'none'; };
   clearTimeout(speechHideTimer);
-  speechHideTimer = setTimeout(() => {
-    nudge.style.display = 'none';
-  }, 8000);
+  speechHideTimer = setTimeout(() => { nudge.style.display = 'none'; }, 8000);
 }
 
 // Initialize speech widget
