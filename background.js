@@ -64,7 +64,8 @@ Text: "${text}"`;
         generationConfig: {
           temperature: 0.2,
           maxOutputTokens: 200,
-          thinkingConfig: { thinkingBudget: 0 }
+          thinkingConfig: { thinkingBudget: 0 },
+          responseMimeType: 'application/json'
         },
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -93,13 +94,8 @@ Text: "${text}"`;
     }
 
     const candidateText = data.candidates[0]?.content?.parts?.[0]?.text;
-
-    if (candidateText) {
-      const cleanedText = candidateText.replace(/```json/g, '').replace(/```/g, '').trim();
-      return JSON.parse(cleanedText);
-    } else {
-      throw new Error('Invalid response structure from Gemini API');
-    }
+    if (candidateText) return JSON.parse(candidateText);
+    throw new Error('Invalid response structure from Gemini API');
 
   } catch (error) {
     console.error('Error analyzing tone:', error);
@@ -133,7 +129,7 @@ async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
           { text: prompt }
         ]
       }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: 'application/json' }
     })
   });
 
@@ -151,9 +147,6 @@ async function analyzeSpeechWithGemini(audioData, mimeType, audioFeatures) {
   }
 
   const candidateText = data.candidates[0]?.content?.parts?.[0]?.text;
-  if (candidateText) {
-    const cleanedText = candidateText.replace(/```json/g, '').replace(/```/g, '').trim();
-    return JSON.parse(cleanedText);
-  }
+  if (candidateText) return JSON.parse(candidateText);
   throw new Error('Invalid response structure from Gemini audio API');
 }

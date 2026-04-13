@@ -3,7 +3,12 @@
 let typingTimer;
 let activeElement = null;
 let currentNudge = null;
-const TYPING_DELAY = 700; // 0.7s debounce — fast enough to feel real-time
+const TYPING_DELAY = 400; // 0.4s debounce — snappy without over-firing
+
+// High-confidence phrases that signal harsh intent in virtually any context.
+// Used for zero-latency pre-screening: shows an alert instantly while the
+// API call runs in parallel and then replaces it with the full result.
+const HARSH_WORD_RE = /\b(idiot|moron|imbecile|incompetent|worthless|despise|loathe|disgusting|pathetic)\b|\bI hate you\b|shut up|go to hell|screw you|piss off/i;
 
 // Per-element tracking so multiple compose windows don't share state
 const lastAnalyzedByElement = new WeakMap();
@@ -142,6 +147,17 @@ async function analyzeActiveInput(el) {
   // Skip if: same text, THIS element already has a request in flight, or rate-limited
   if (text === lastText || analysisInFlightSet.has(el) || Date.now() < rateLimitedUntil) return;
 
+  // ── Instant local pre-screen (zero API latency) ──────────────────────────
+  // For unambiguously harsh words, show a preliminary alert immediately so the
+  // user gets feedback right away. The API call below replaces it with a full
+  // reason + alternative, or removes it if context makes the text acceptable.
+  if (HARSH_WORD_RE.test(text)) {
+    showNudge(el, {
+      reason: 'Potentially harsh tone detected — refining suggestion…',
+      alternative: 'Analyzing for a better alternative…'
+    });
+  }
+
   lastAnalyzedByElement.set(el, text);
   analysisInFlightSet.add(el);
 
@@ -160,9 +176,9 @@ async function analyzeActiveInput(el) {
     }
 
     if (response.isHarsh) {
-      showNudge(el, response);
+      showNudge(el, response); // replace preliminary (or show fresh) with full result
     } else if (currentNudge) {
-      currentNudge.remove();
+      currentNudge.remove(); // pre-screen was wrong — context made it acceptable
       currentNudge = null;
     }
   });
@@ -341,19 +357,18 @@ class AudioSentimentAnalyzer {
   }
 
   start(onDetect) {
-    // setInterval instead of requestAnimationFrame: rAF is throttled/stopped when
-    // the tab is in the background or Zoom's video layer steals GPU priority.
-    // 50 ms = 20 fps — plenty for audio-envelope analysis.
+    // 30 ms = ~33 fps: builds the 60-frame baseline in ~1.8 s instead of 3 s,
+    // so ANGRY/STRESSED detection becomes live 40% faster than before.
     this.intervalId = setInterval(() => {
       const result = this.classify();
       if (result) {
         const now = Date.now();
-        if (now - this.lastAlertTime > 4000) { // throttle: one local alert per 4 s
+        if (now - this.lastAlertTime > 2500) { // throttle: one local alert per 2.5 s
           this.lastAlertTime = now;
           onDetect(result);
         }
       }
-    }, 50);
+    }, 30);
   }
 
   stop() {
