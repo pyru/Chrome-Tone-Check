@@ -2,6 +2,10 @@
 
 ToneCheck watches your writing and speaking in real time and gives you a gentle nudge when your tone sounds harsh, angry, or aggressive — powered by Google Gemini AI.
 
+## Watch the Demo
+
+[![ToneCheck Demo](https://img.youtube.com/vi/GkYNoTbLveg/0.jpg)](https://www.youtube.com/watch?v=GkYNoTbLveg)
+
 ---
 
 ## What It Does
